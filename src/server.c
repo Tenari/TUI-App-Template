@@ -17,7 +17,7 @@
 #include "string_chunk.c"
 
 ///// CONSTANTS
-#define MAX_ENTITIES (2<<18)
+#define MAX_THINGS (2<<18)
 #define LEFT_ROOM_ENTITES_LEN (KB(1))
 #define ROOM_MAP_COLLISIONS_LEN MAX_ROOMS/8
 #define CLIENT_COMMAND_LIST_LEN 8
@@ -57,22 +57,34 @@ typedef struct ParsedClientCommandThreadQueue {
   Cond not_full;
 } ParsedClientCommandThreadQueue;
 
-typedef struct Entity {
+typedef struct ThingRef {
+  u32 i;
+  u32 gen;
+} ThingRef;
+
+typedef struct Thing {
+  ThingType type;
   bool changed;
   u8 x;
   u8 y;
   u8 color;
-  EntityType type;
   u32 misc;
-  u64 id;
+  ThingRef id;
   u64 features;
-} Entity;
+} Thing;
+
+typedef struct Things {
+  u32 first_free;
+  u32 next_free[MAX_THINGS];
+  u32 gen[MAX_THINGS];
+  Thing things[MAX_THINGS];
+} Things;
 
 typedef struct Account {
   u64 id;
   String name;
   String pw;
-  u64 eid;
+  ThingRef eid;
 } Account;
 
 typedef struct AccountChunk {
@@ -82,30 +94,10 @@ typedef struct AccountChunk {
   Account* items; // the actual accounts
 } AccountChunk;
 
-typedef struct EntityList {
-  u64 length; // the currently used length
-  u64 capacity;
-  Entity* items;
-} EntityList;
-
-typedef struct EntityChunk {
-  u64 length; // the currently used # of entities in this chunk
-  u64 capacity; // the "chunk size" / space in this chunk
-  struct EntityChunk* next; // the next chunk
-  Entity* items; // the actual entities
-} EntityChunk;
-
-typedef struct ChunkedEntityList {
-  u64 length; // the current number of entities
-  u64 chunk_size; // the # of entities per chunk
-  u64 chunks; // the # of chunks in this list so far
-  EntityChunk* first; // the first chunk of entities
-} ChunkedEntityList;
-
 typedef struct Client {
   u16 lan_port;
   i32 lan_ip;
-  u64 character_eid;
+  ThingRef character_eid;
   u64 account_id;
   SocketAddress address;
   CommandType commands[CLIENT_COMMAND_LIST_LEN];
@@ -122,23 +114,85 @@ typedef struct State {
   Mutex client_mutex;
   Mutex mutex;
   ClientList clients;
-  u64 next_eid;
   AccountChunk accounts;
   u64 frame;
   Arena game_scratch;
   StringArena string_arena;
   ParsedClientCommandThreadQueue* network_recv_queue;
   OutgoingMessageQueue* network_send_queue;
+  Things* things;
 } State;
 
 ///// Global Variables
 global State state = { 0 };
 global Arena permanent_arena = { 0 };
-global const Entity NULL_ENTITY = { 0 };
+global const Thing NULL_THING = { 0 };
 global bool debug_mode = false;
-global ChunkedEntityList free_chunks = { 0, CHUNK_SIZE, 0, NULL };
 
 ///// functionImplementations()
+fn bool thingRefsEq(ThingRef a, ThingRef b) {
+  return a.i == b.i && a.gen == b.gen;
+}
+
+fn void thingsInit(Things* things) {
+  MemoryZero(things->next_free, sizeof(things->next_free));
+  MemoryZero(things->gen, sizeof(things->gen));
+  MemoryZero(things->things, sizeof(things->things));
+  // 0 is the NULL_THING
+  things->first_free = 1;
+  // they are all free initially,
+  // except the last slot has nothing to point to, and
+  // the first slot is for the NULL_THING
+  for (u32 i = 1; i < MAX_THINGS-1; i++) {
+    things->next_free[i] = i+1;
+  }
+}
+
+fn u32 thingDeref(Things* t, ThingRef ref) {
+  if (ref.i > 0 && ref.i < MAX_THINGS && t->gen[ref.i] == ref.gen) {
+    return ref.i;
+  } else {
+    return 0;
+  }
+}
+
+fn ThingRef thingAdd(Things* t, Thing thing) {
+  ThingRef result = {0};
+  u32 slot = t->first_free;
+  if (slot) {
+    MemoryCopyStruct(&t->things[slot], &thing);
+    t->gen[slot] += 1;
+    t->first_free = t->next_free[slot];
+    t->next_free[slot] = 0; // sort of indicates that this slot is used
+    result.gen = t->gen[slot];
+    result.i = slot;
+    t->things[slot].id = result;
+  }
+  return result;
+}
+
+fn Thing* thingGet(Things* t, ThingRef ref) {
+  u32 slot = thingDeref(t, ref);
+  if (slot) {
+    return &t->things[slot];
+  } else {
+    return (Thing*)&NULL_THING;
+  }
+}
+
+fn bool thingRemove(Things* t, ThingRef ref) {
+  u32 slot = thingDeref(t, ref);
+  if (slot) {
+    if (t->first_free) {
+      t->next_free[slot] = t->first_free;
+    }
+    t->first_free = slot;
+    return true;
+  } else {
+    return false;
+  }
+}
+
 fn ParsedClientCommandThreadQueue* newPCCThreadQueue(Arena* a) {
   ParsedClientCommandThreadQueue* result = arenaAlloc(a, sizeof(ParsedClientCommandThreadQueue));
   MemoryZero(result, (sizeof *result));
@@ -182,13 +236,14 @@ fn ParsedClientCommand* pccThreadSafeNonblockingQueuePop(ParsedClientCommandThre
   return result;
 }
 
-fn u64 entitySerialize(Entity current, Account* acct, u64 index, u8 bytes[]) {
-  // send entity header (common to all entity types)
-  index += writeU64ToBufferLE(bytes + index, current.id);
+fn u64 thingSerialize(Thing current, Account* acct, u64 index, u8 bytes[]) {
+  // send thing header (common to all thing types)
+  index += writeU32ToBufferLE(bytes + index, current.id.i);
+  index += writeU32ToBufferLE(bytes + index, current.id.gen);
   index += writeU64ToBufferLE(bytes + index, current.features);
   bytes[index++] = current.x;
   bytes[index++] = current.y;
-  bytes[index++] = (u8)current.type;  // EntityType
+  bytes[index++] = (u8)current.type;  // ThingType
 
   //if (CheckFlag(current.features, FeatureRegensHp)) {
   //  index += writeU16ToBufferLE(bytes + index, current.hp);
@@ -196,7 +251,7 @@ fn u64 entitySerialize(Entity current, Account* acct, u64 index, u8 bytes[]) {
   //}
 
   // send character-specific details (color and name)
-  if (current.type == EntityCharacter) {
+  if (current.type == ThingCharacter) {
     bytes[index++] = current.color;
     // send name string
     index += writeU64ToBufferLE(bytes + index, acct->name.length);
@@ -207,10 +262,10 @@ fn u64 entitySerialize(Entity current, Account* acct, u64 index, u8 bytes[]) {
   return index;
 }
 
-fn u64 entityFeaturesFromType(EntityType type) {
+fn u64 thingFeaturesFromType(ThingType type) {
   u64 result = 0;
   switch (type) {
-    case EntityCharacter: {
+    case ThingCharacter: {
       SetFlag(result, FeatureWalksAround);
       SetFlag(result, FeatureCanFight);
     } break;
@@ -233,11 +288,11 @@ fn Account* findAccountById(u64 id) {
   return NULL;
 }
 
-fn Account* findAccountByEId(u64 id) {
+fn Account* findAccountByEId(ThingRef id) {
   AccountChunk* current = &state.accounts;
   while (current != NULL) {
     for (u32 i = 0; i < current->length; i++) {
-      if (current->items[i].eid == id) {
+      if (thingRefsEq(current->items[i].eid, id)) {
         return &current->items[i];
       }
     }
@@ -285,93 +340,6 @@ fn Account* newAccount(Arena* a, Account details) {
   return NULL;
 }
 
-fn u64 pushEntity(EntityChunk* chunk, Entity e) {
-  assert(chunk->length < chunk->capacity);
-  chunk->items[chunk->length] = e;
-  u64 result = chunk->length;
-  chunk->length += 1;
-  return result;
-}
-
-fn bool isSpaceInChunk(EntityChunk* chunk) {
-  return chunk->length < chunk->capacity;
-}
-
-fn bool allChunksFull(ChunkedEntityList list) {
-  return list.length >= (list.chunk_size * list.chunks);
-}
-
-fn EntityChunk* pushNewChunk(Arena* a, ChunkedEntityList* list) {
-  EntityChunk* new_chunk;
-  if (free_chunks.length > 0) {
-    new_chunk = free_chunks.first;
-    free_chunks.length -= 1;
-    free_chunks.first = new_chunk->next;
-  } else {
-    new_chunk = arenaAlloc(a, sizeof(EntityChunk));
-    // alloc the new chunk of entities
-    new_chunk->length = 0;
-    new_chunk->capacity = list->chunk_size;
-    new_chunk->next = NULL;
-    new_chunk->items = arenaAllocArray(a, Entity, list->chunk_size);
-  }
-  // bookeeping in the list
-  list->chunks += 1;
-  if (list->first == NULL) {
-    list->first = new_chunk;
-  } else {
-    EntityChunk* last = list->first;
-    while (last->next != NULL) {
-      last = last->next;
-    }
-    last->next = new_chunk;
-  }
-  return new_chunk;
-}
-
-fn Entity* entityPtrFromChunkList(ChunkedEntityList* list, i32 index) {
-  Entity* result = (Entity*)&NULL_ENTITY;
-  i32 chunk_index = index / list->chunk_size;
-  EntityChunk* chunk = list->first;
-  for (i32 i = 0; i < chunk_index; i++) {
-    chunk = chunk->next;
-  }
-  result = &chunk->items[index % list->chunk_size];
-  return result;
-}
-
-fn Entity entityFromChunkList(ChunkedEntityList* list, i32 index) {
-  Entity result = {0};
-  i32 chunk_index = index / list->chunk_size;
-  EntityChunk* chunk = list->first;
-  for (i32 i = 0; i < chunk_index; i++) {
-    chunk = chunk->next;
-  }
-  result = chunk->items[index % list->chunk_size];
-  return result;
-}
-
-fn bool deleteLastEntity(ChunkedEntityList* list, EntityChunk* last_chunk, EntityChunk* second_to_last_chunk) {
-  last_chunk->length -= 1;
-  list->length -= 1;
-  // don't delete the room's only chunk, but otherwise move the chunk to the free-list
-  if (last_chunk->length == 0 && last_chunk != list->first) {
-    list->chunks -= 1;
-    second_to_last_chunk->next = NULL;
-    free_chunks.length += 1;
-    EntityChunk* last_free_chunk = free_chunks.first;
-    if (last_free_chunk) {
-      while (last_free_chunk->next != NULL) {
-        last_free_chunk = last_free_chunk->next;
-      }
-      last_free_chunk->next = last_chunk;
-    } else {
-      free_chunks.first = last_chunk;
-    }
-  }
-  return true;
-}
-
 fn void exitWithErrorMessage(ptr msg) {
   printf("error: %s", msg);
   exit(1);
@@ -384,7 +352,7 @@ fn u32 pushClient(ClientList* clients, SocketAddress addr) {
 
   // first, try to overwrite an old dc'ed client
   for (u32 i = 1; i < clients->length; i++) {
-    if (clients->items[i].character_eid == 0) {
+    if (clients->items[i].account_id == 0) {
       clients->items[i] = new_client;
       return i;
     }
@@ -398,12 +366,12 @@ fn u32 pushClient(ClientList* clients, SocketAddress addr) {
   return result;
 }
 
-fn bool deleteClientByEId(ClientList* clients, u64 id) {
+fn bool deleteClientByEId(ClientList* clients, ThingRef id) {
   bool succeeded = false;
   Client blank_client = {0};
   // i=1 because first client is null-client
   for (u32 i = 1; i < clients->length && !succeeded; i++) {
-    if (clients->items[i].character_eid == id) {
+    if (thingRefsEq(clients->items[i].character_eid, id)) {
       clients->items[i] = blank_client;
       succeeded = true;
     }
@@ -411,10 +379,10 @@ fn bool deleteClientByEId(ClientList* clients, u64 id) {
   return succeeded;
 }
 
-fn u32 findClientHandleByEId(ClientList* clients, u64 id) {
+fn u32 findClientHandleByEId(ClientList* clients, ThingRef id) {
   for (u32 i = 0; i < clients->length; i++) {
     Client c = clients->items[i];
-    if (c.character_eid == id) {
+    if (thingRefsEq(c.character_eid, id)) {
       return i;
     }
   }
@@ -533,7 +501,7 @@ fn void* sendNetworkUpdates(void* sock) {
           memset(&state.clients.items[i], 0, sizeof(Client));
           continue;
         }
-        if (client.character_eid == 0) {
+        if (client.character_eid.i == 0) {
           continue; // they are still creating their character
         }
 
@@ -547,6 +515,18 @@ fn void* sendNetworkUpdates(void* sock) {
     }
   }
   return NULL;
+}
+
+fn bool messageSendCharacterId(SocketAddress sender, ThingRef id) {
+  UDPMessage outgoing_message = {0};
+  outgoing_message.address = sender;
+  outgoing_message.bytes_len = 9;
+  outgoing_message.bytes[0] = (u8)MessageCharacterId;
+  writeU32ToBufferLE(outgoing_message.bytes + 1, id.i);
+  writeU32ToBufferLE(outgoing_message.bytes + 5, id.gen);
+  outgoingMessageQueuePush(state.network_send_queue, &outgoing_message);
+  printf("MessageCharacterId sent\n");
+  return true;
 }
 
 fn void* gameLoop(void* params) {
@@ -639,16 +619,11 @@ fn void* gameLoop(void* params) {
               existing_account = newAccount(&permanent_arena, new_account);
             }
             client->account_id = existing_account->id;
-            if (existing_account->eid != 0) {
+            if (existing_account->eid.i != 0) {
               client->character_eid = existing_account->eid;
 
               // tell the client their character id
-              outgoing_message.bytes[0] = (u8)MessageCharacterId;
-              writeU64ToBufferLE(outgoing_message.bytes + 1, existing_account->eid);
-              outgoing_message.bytes_len = 9;
-              outgoing_message.address = sender;
-              outgoingMessageQueuePush(state.network_send_queue, &outgoing_message);
-              printf("MessageCharacterId sent\n");
+              messageSendCharacterId(sender, existing_account->eid);
             } else {
               // tell the client they made a new account
               outgoing_message.bytes[0] = (u8)MessageNewAccountCreated;
@@ -657,32 +632,26 @@ fn void* gameLoop(void* params) {
               outgoingMessageQueuePush(state.network_send_queue, &outgoing_message);
               printf("MessageNewAccountCreated sent\n");
             }
-            printf("eid=%lld, client_handle=%d, acct_id=%lld\n", existing_account->eid, client_handle, existing_account->id);
+            printf("eid=%d, client_handle=%d, acct_id=%lld\n", existing_account->eid.i, client_handle, existing_account->id);
           } break;
           case CommandCreateCharacter: {
-            if (client->character_eid == 0) {
+            if (client->character_eid.i == 0) {
               // Create new character
               XYZ room_xyz = {0, 0, 0 };
-              Entity character = {
-                .type = EntityCharacter,
-                .id = state.next_eid++,
+              Thing character = {
+                .type = ThingCharacter,
                 .changed = true,
-                .features = entityFeaturesFromType(EntityCharacter),
+                .features = thingFeaturesFromType(ThingCharacter),
                 .color = msg.byte,
               };
               dbg("made new character id=%ld\n", character.id);
               client->character_eid = character.id;
               Account* account = findAccountById(client->account_id);
               account->eid = character.id;
-              printf("character_eid=%lld, client_handle=%d, acct_id=%lld\n", account->eid, client_handle, account->id);
+              printf("character_eid=%d, client_handle=%d, acct_id=%lld\n", account->eid.i, client_handle, account->id);
 
               // tell the client their character id
-              outgoing_message.address = sender;
-              outgoing_message.bytes_len = 9;
-              outgoing_message.bytes[0] = (u8)MessageCharacterId;
-              writeU64ToBufferLE(outgoing_message.bytes + 1, character.id);
-              outgoingMessageQueuePush(state.network_send_queue, &outgoing_message);
-              printf("MessageCharacterId sent\n");
+              messageSendCharacterId(sender, character.id);
             } else {
               printf("client tried to create a character when he already has one.");
             }
@@ -728,18 +697,14 @@ fn void* gameLoop(void* params) {
 // THE SERVER
 i32 main(i32 argc, ptr argv[]) {
   osInit();
-  // multi-thread architecture:
+  // architecture:
+  //  - the sendNetworkUpdates() infinite loop, which sends a UDP snapshot-or-delta update to each connected client N/sec
+  //  - the receiveNetworkUpdates() infinte loop, which waits for new UDP messages from clients
   //  - the gameLoop() which just inifinite loops every "tick" and processes user input and updates gameworld state
-  //    - TODO: actually make this N "lanes" as described https://www.rfleury.com/p/multi-core-by-default
-  //      such that we can split room-work among all the various cores on our machine
-  //  - one is the sendNetworkUpdates() infinite loop, which sends a UDP snapshot-or-delta update to each connected client N/sec
-  //  - one is the receiveNetworkUpdates() infinte loop, which waits for new UDP messages from clients
+  //    - this is N "lanes" as described https://www.rfleury.com/p/multi-core-by-default
+  //        such that we can split room-work among all the various cores on our machine
 
-  // 1. initialize gameworld, and spin off infinite game-loop thread
-  // 2. spin off sendNetworkUpdates() infinite loop thread
-  // 3. infinitely wait for incoming UDP messages and process them (usually by just dropping user-commands into the relevant block of shared memory)
-
-  // 1. initialize gameworld, and spin off infinite game-loop thread
+  // initialize gameworld, and spin off infinite game-loop thread
   arenaInit(&permanent_arena);
   arenaInit(&state.game_scratch);
   arenaInit(&state.string_arena.a);
@@ -755,14 +720,14 @@ i32 main(i32 argc, ptr argv[]) {
   state.clients.items = (Client*)arenaAllocArray(&permanent_arena, Client, SERVER_MAX_CLIENTS);
   state.accounts.capacity = ACCOUNT_CHUNK_SIZE;
   state.accounts.items = arenaAllocArray(&permanent_arena, Account, ACCOUNT_CHUNK_SIZE);
+  state.things = arenaAllocZero(&permanent_arena, sizeof(Things));
 
-  // 2. spin off sendNetworkUpdates() infinite loop thread
+  // networking threads (send + receive)
   UDPServer listener = createUDPServer(SERVER_PORT);
   if (!listener.ready) {
     exitWithErrorMessage("Couldn't start the udp server");
   }
   Thread send_thread = spawnThread(&sendNetworkUpdates, &listener.server_socket);
-  // 3. infinitely wait for incoming UDP messages and process them (usually by just dropping user-commands into the relevant block of shared memory)
   Thread recv_thread = spawnThread(&receiveNetworkUpdates, &listener);
 
   u64 lane_broadcast_val = 0;
@@ -779,6 +744,9 @@ i32 main(i32 argc, ptr argv[]) {
   for (u32 i = 0; i < GAME_THREAD_CONCURRENCY; i++) {
     osThreadJoin(game_threads[i], MAX_u64);
   }
+
+  osThreadJoin(send_thread, MAX_u64);
+  osThreadJoin(recv_thread, MAX_u64);
 
   return 0;
 }

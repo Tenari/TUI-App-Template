@@ -6,21 +6,24 @@
 ///// #define some game-tunable constants
 #define GAME_CONSTANT_ONE (1)
 #define GAME_CONSTANT_TWO (2)
+#define THING_HEADER_MESSAGE_SIZE (8+8+1+1+1)
+#define THING_MESSAGE_SIZE (THING_HEADER_MESSAGE_SIZE+2+2+2+2+8+1+1)
 
-typedef enum EntityFeature {
+typedef enum ThingFeature {
   FeatureWalksAround,
   FeatureCanFight,
-  EntityFeature_Count
-} EntityFeature;
+  ThingFeature_Count
+} ThingFeature;
 
-typedef enum EntityType {
-  EntityNull,
-  EntityWall,
-  EntityDoor,
-  EntityCharacter,
-  EntityType_Count,
-} EntityType;
-static const char* ENTITY_STRINGS[] = {
+typedef enum ThingType {
+  ThingNull,
+  ThingWall,
+  ThingDoor,
+  ThingCharacter,
+  ThingType_Count,
+} ThingType;
+
+static const char* THING_TYPE_STRINGS[] = {
   "NULL",
   "Wall",
   "Door",
@@ -58,8 +61,6 @@ static const char* command_type_strings[] = {
   "CreateCharacter",
 };
 
-#define ENTITY_HEADER_MESSAGE_SIZE (8+8+1+1+1)
-#define ENTITY_MESSAGE_SIZE (ENTITY_HEADER_MESSAGE_SIZE+2+2+2+2+8+1+1)
 typedef enum Message {
   MessageInvalid,
   MessageCharacterId,

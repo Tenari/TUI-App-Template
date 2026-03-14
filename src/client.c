@@ -49,21 +49,21 @@ typedef enum SpeechTailDirection {
   SpeechTailDirection_Count
 } SpeechTailDirection;
 
-typedef struct Entity {
-  EntityType type;
+typedef struct Thing {
+  ThingType type;
   u8 x;
   u8 y;
   u8 color;
   u64 features;
   u64 id;
   StringChunkList name;
-} Entity;
+} Thing;
 
-typedef struct EntityList {
+typedef struct ThingList {
   u64 length; // the currently used length
   u64 capacity;
-  Entity* items;
-} EntityList;
+  Thing* items;
+} ThingList;
 
 typedef struct ParsedServerMessage {
   Message type;
@@ -74,7 +74,7 @@ typedef struct ParsedServerMessage {
   u64 id;
   u64 server_frame;
   XYZ xyz;
-  //Entity entities[PARSED_CLIENT_ENTITY_LEN];
+  //Thing things[PARSED_CLIENT_THING_LEN];
   //u64 ids[PARSED_IDS_LEN];
 } ParsedServerMessage;
 
@@ -105,11 +105,11 @@ typedef struct MenuState {
 typedef struct GameState {
   Screen screen;
   Screen old_screen;
-  EntityList entities;
-  Entity me;
+  ThingList things;
+  Thing me;
   u64 server_frame;
   u64 loop_count;
-  Arena entity_arena;
+  Arena thing_arena;
   StringArena string_arena;
   LoginState login_state;
   MenuState menu;
@@ -175,16 +175,16 @@ fn ParsedServerMessage* psmThreadSafeNonblockingQueuePop(ParsedServerMessageThre
   return result;
 }
 
-fn void entityPush(EntityList* list, Entity e) {
+fn void thingPush(ThingList* list, Thing e) {
   if (list->length >= list->capacity) {
-    arenaAllocArray(&state.entity_arena, Entity, list->capacity);
+    arenaAllocArray(&state.thing_arena, Thing, list->capacity);
     list->capacity = list->capacity * 2;
   }
   list->items[list->length] = e;
   list->length += 1;
 }
 
-fn bool entityDelete(EntityList* list, u64 id) {
+fn bool thingDelete(ThingList* list, u64 id) {
   assert(list->length > 0);
   if (list->items[list->length - 1].id == id) {
     list->length -= 1;
@@ -342,10 +342,10 @@ fn void renderStaticAssetToPixelBuffer(TuiState* tui, u8* asset, u32 len, u16 x,
 fn void clearServerSentState() {
   //memset(&state.current_room, 0, sizeof(RenderableRoom));
 
-  arenaClear(&state.entity_arena);
-  state.entities.capacity = 64;
-  state.entities.length = 0;
-  state.entities.items = arenaAllocArray(&state.entity_arena, Entity, state.entities.capacity);
+  arenaClear(&state.thing_arena);
+  state.things.capacity = 64;
+  state.things.length = 0;
+  state.things.items = arenaAllocArray(&state.thing_arena, Thing, state.things.capacity);
 }
 
 fn void handleIncomingMessage(u8* message, u32 len, SocketAddress sender, i32 socket) {
@@ -692,10 +692,10 @@ i32 main(i32 argc, ptr argv[]) {
 
   // clear and init the state
   arenaInit(&permanent_arena);
-  arenaInit(&state.entity_arena);
-  state.entities.capacity = 64;
-  state.entities.length = 0;
-  state.entities.items = arenaAllocArray(&state.entity_arena, Entity, state.entities.capacity);
+  arenaInit(&state.thing_arena);
+  state.things.capacity = 64;
+  state.things.length = 0;
+  state.things.items = arenaAllocArray(&state.thing_arena, Thing, state.things.capacity);
   arenaInit(&state.string_arena.a);
   state.string_arena.mutex = newMutex();
   state.message_input = stringChunkListInit(&state.string_arena);
@@ -721,7 +721,19 @@ i32 main(i32 argc, ptr argv[]) {
     printf("bad network startup");
     exit(1);
   }
-  state.client = createUDPClient(7777, argc > 1 ? argv[1] : NULL);
+  ptr server_address = NULL;
+  if (argc > 1) {
+    server_address = argv[1];
+  } else {
+    printf("Server IP Address: ");
+    char input_string[16] = { 0 };
+    scanf("%15s", input_string);
+    printf("%s", input_string);
+    if (input_string[0] && input_string[1] && input_string[2] && input_string[3]) {
+      server_address = input_string;
+    }
+  }
+  state.client = createUDPClient(7777, server_address);
 
   // "hardcoded" keep alive message to periodically send to server
   state.keep_alive_msg.address = state.client.server_address;

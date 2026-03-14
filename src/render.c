@@ -4,17 +4,17 @@
 #define MAX_SCREEN_HEIGHT 300
 #define MAX_SCREEN_WIDTH 800
 
-fn str charForEntity(EntityType e) {
+fn str charForThing(ThingType e) {
   switch (e) {
-    case EntityWall:
+    case ThingWall:
       return "# ";
-    case EntityDoor:
+    case ThingDoor:
       return "🚪";
-    case EntityCharacter:
+    case ThingCharacter:
       return "🧙";
       //return "웃";
-    case EntityNull:
-    case EntityType_Count:
+    case ThingNull:
+    case ThingType_Count:
     //default: // commented out so that we get a warning for missing entity
       return "  ";
   }
@@ -38,21 +38,21 @@ fn void renderRoom(Pixel* buf, u32 x, u32 y, RenderableRoom* room, Dim2 screen_d
       }
       u32 bufpos = (x+1+(i*2)) + (screen_dimensions.width*(y+1+j));
 
-      str fg_char = charForEntity(room->foreground[roompos]);
+      str fg_char = charForThing(room->foreground[roompos]);
       RGB background_color = colorForTile(room->background[roompos]);
       if (room->visible[roompos]) {
-        buf[bufpos].foreground = ansiColorForEntity(room->foreground[roompos]);
+        buf[bufpos].foreground = ansiColorForThing(room->foreground[roompos]);
         if (room->light[roompos] < VISIBLE_BRIGHTNESS_CUTOFF) {
-          fg_char = charForEntity(EntityMurkyUnknown);
+          fg_char = charForThing(ThingMurkyUnknown);
           background_color = rgbDarken(background_color, 0.8);
         }
       } else if (room->memory[roompos] == RememberedTileQualityDim) {
         background_color = rgbDarken(background_color, 0.4);
-        buf[bufpos].foreground = ansiColorForEntity(room->foreground[roompos]);
-        fg_char = charForEntity(EntityMurkyUnknown);
+        buf[bufpos].foreground = ansiColorForThing(room->foreground[roompos]);
+        fg_char = charForThing(ThingMurkyUnknown);
       } else if (room->memory[roompos] == RememberedTileQualityClear) {
         background_color = rgbDarken(background_color, 0.6);
-        buf[bufpos].foreground = ansiColorForEntity(room->foreground[roompos]);
+        buf[bufpos].foreground = ansiColorForThing(room->foreground[roompos]);
       }
       buf[bufpos].background = rgbToAnsi(background_color);
       Utf8Character first_character_class = classifyUtf8Character((u8)fg_char[0]);
