@@ -189,6 +189,10 @@
 # define assertBreak() (*(volatile int*)0 = 0)
 #endif
 
+#ifndef offsetof
+# define offsetof(st, m) ((size_t)&(((st*)0)->m))
+#endif
+
 #if ENABLE_ASSERT
 # define assert(c) stmnt( if (!(c)){ assertBreak(); } )
 #else
@@ -319,6 +323,31 @@ typedef enum Utf8Character {
   Utf8Character_Count,
 } Utf8Character;
 
+typedef enum FieldType {
+  FieldTypeU8,
+  FieldTypeU16,
+  FieldTypeU32,
+  FieldTypeFloat,
+  FieldTypeString,
+  FieldTypeEnum,
+  FieldType_Count,
+} FieldType;
+
+typedef struct FieldDescriptor {
+  str name;
+  FieldType type;
+  size_t offset;
+  int width;  // column width for display
+  str* enum_vals;
+} FieldDescriptor;
+
+typedef struct TableDrawInfo {
+  u32 x_offset;
+  u32 y_offset;
+  u32 rows;
+  u32 cols;
+} TableDrawInfo;
+
 typedef struct Box {
   u32 x;
   u32 y;
@@ -335,6 +364,11 @@ typedef struct Pos2 {
   u16 x;
   u16 y;
 } Pos2;
+
+typedef struct Pos2u8 {
+  u8 x;
+  u8 y;
+} Pos2u8;
 
 typedef union Range1u32 Range1u32;
 union Range1u32
@@ -399,6 +433,7 @@ union Range1f32
 #  include <ws2tcpip.h>
 #  include <timeapi.h>
 #  include <conio.h>
+#  include <pthread.h>
   typedef struct {
 	  DWORD input_mode;
 	  DWORD output_mode;
@@ -468,6 +503,8 @@ global const u64 MAX_u64 = 0xffffffffffffffffull;
 global const u32 MAX_u32 = 0xffffffff;
 global const u16 MAX_u16 = 0xffff;
 global const u8  MAX_u8  = 0xff;
+#define EULERS_E (2.71828)
+#define PI (3.14159265358979323846)
 
 ///// CUSTOM ENTRY POINT
 /* TODO?
