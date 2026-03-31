@@ -632,5 +632,34 @@ fn void tctxLaneBarrierWait(void *broadcast_ptr, u64 broadcast_size, u64 broadca
 #define LaneSyncu64(pointer, src_lane_idx) tctxLaneBarrierWait((pointer), sizeof(*(pointer)), (src_lane_idx))
 #define LaneRange(count) mRangeFromNIdxMCount(LaneIdx(), LaneCount(), (count))
 
+///// StringChunk stuff
+#ifndef STRING_CHUNK_PAYLOAD_SIZE
+#define STRING_CHUNK_PAYLOAD_SIZE (64 - sizeof(StringChunk*))
+#endif
+
+typedef struct StringChunk {
+  struct StringChunk *next; // essentially a header, followed by a fixed maximum str bytes
+} StringChunk;
+
+typedef struct StringChunkList {
+  StringChunk* first;
+  StringChunk* last;
+  u64 count;
+  u64 total_size;
+} StringChunkList;
+
+typedef struct StringArena {
+  Arena a;
+  StringChunk* first_free_str_chunk;
+  Mutex mutex;
+} StringArena;
+
+fn StringChunkList allocStringChunkList(StringArena* a, String string);
+fn void releaseStringChunkList(StringArena* a, StringChunkList* list);
+fn String stringChunkToString(Arena* a, StringChunkList list);
+fn void stringChunkListAppend(StringArena* a, StringChunkList* list, String string);
+fn void stringChunkListDeleteLast(StringArena* a, StringChunkList* list);
+fn StringChunkList stringChunkListInit(StringArena* a);
+fn void stringChunkCopyToBuffer(StringChunkList* list, u8* buffer, u32 len);
 
 #endif// BASE_ALL_H

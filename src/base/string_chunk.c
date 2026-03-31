@@ -1,4 +1,4 @@
-#include "string_chunk.h"
+#include "all.h"
 
 fn StringChunkList allocStringChunkList(StringArena* a, String string) {
   StringChunkList result = {0};

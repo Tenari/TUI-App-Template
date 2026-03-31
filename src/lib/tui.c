@@ -1,5 +1,4 @@
 #include "../base/all.h"
-#include "../string_chunk.h"
 #include <stdlib.h>
 #include <stdio.h>
 #include <unistd.h>

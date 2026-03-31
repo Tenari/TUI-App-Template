@@ -10,7 +10,6 @@
 #include "base/impl.c"
 #include "lib/network.c"
 #include "render.c"
-#include "string_chunk.c"
 //#include "assets/asset1.h"
 //#include "assets/asset2.h"
 //#include "assets/asset3.h"

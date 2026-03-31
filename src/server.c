@@ -14,7 +14,6 @@
 #define NET_OUTGOING_MESSAGE_QUEUE_LEN 64
 #include "lib/network.c"
 #include "render.c"
-#include "string_chunk.c"
 
 ///// CONSTANTS
 #define MAX_THINGS (2<<18)

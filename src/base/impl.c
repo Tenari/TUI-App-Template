@@ -8,5 +8,6 @@
 #include "string.c"
 #include "tctx.c"
 #include "thread.c"
+#include "string_chunk.c"
 
 #endif // BASE_IMPL_C
