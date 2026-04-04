@@ -6,6 +6,9 @@
 ///// #define some game-tunable constants
 #define GAME_CONSTANT_ONE (1)
 #define GAME_CONSTANT_TWO (2)
+#define SBUFLEN (512)
+#define MAX_SCREEN_HEIGHT 300
+#define MAX_SCREEN_WIDTH 800
 #define THING_HEADER_MESSAGE_SIZE (8+8+1+1+1)
 #define THING_MESSAGE_SIZE (THING_HEADER_MESSAGE_SIZE+2+2+2+2+8+1+1)
 
@@ -49,16 +52,16 @@ typedef enum Direction {
 
 typedef enum CommandType {
   CommandInvalid,
-  CommandKeepAlive,
   CommandLogin,
   CommandCreateCharacter,
+  CommandUDPPing,
   CommandType_Count,
 } CommandType;
-static const char* command_type_strings[] = {
+static const char* COMMAND_TYPE_STRINGS[] = {
   "Invalid",
-  "KeepAlive",
   "Login",
   "CreateCharacter",
+  "UDP Ping",
 };
 
 typedef enum Message {
@@ -66,6 +69,7 @@ typedef enum Message {
   MessageCharacterId,
   MessageBadPw,
   MessageNewAccountCreated,
+  MessageUDPPong,
   Message_Count,
 } Message;
 static const char* MESSAGE_STRINGS[] = {
@@ -73,6 +77,104 @@ static const char* MESSAGE_STRINGS[] = {
   "CharacterId",
   "BadPw",
   "NewAccountCreated",
+  "UDP Pong",
 };
+
+fn str charForThing(ThingType e) {
+  switch (e) {
+    case ThingWall:
+      return "# ";
+    case ThingDoor:
+      return "🚪";
+    case ThingCharacter:
+      return "🧙";
+      //return "웃";
+    case ThingNull:
+    case ThingType_Count:
+    //default: // commented out so that we get a warning for missing entity
+      return "  ";
+  }
+}
+
+/* HERE IS WHERE I USUALLY PUT THE "room" OR "map" DRAWING FUNCTION
+ *
+fn void renderRoom(Pixel* buf, u32 x, u32 y, RenderableRoom* room, Dim2 screen_dimensions, bool active) {
+  // x,y is starting cursor location of upper-left corner
+  Box b = { .x = x, .y = y, .width = ROOM_WIDTH*2, .height = ROOM_HEIGHT };
+  drawAnsiBox(buf, b, screen_dimensions, active);
+  // start printing the rows
+  // move cursor to beginning of the room
+  for (i32 j = 0; j < ROOM_HEIGHT; j++) {
+    for (i32 i = 0; i < ROOM_WIDTH; i++) {
+      u32 roompos = XYToPos(i, j, ROOM_WIDTH);
+      if (!room->visible[roompos] && room->memory[roompos] == RememberedTileQualityNone) {
+        continue;
+      }
+      u32 bufpos = (x+1+(i*2)) + (screen_dimensions.width*(y+1+j));
+
+      str fg_char = charForThing(room->foreground[roompos]);
+      RGB background_color = colorForTile(room->background[roompos]);
+      if (room->visible[roompos]) {
+        buf[bufpos].foreground = ansiColorForThing(room->foreground[roompos]);
+        if (room->light[roompos] < VISIBLE_BRIGHTNESS_CUTOFF) {
+          fg_char = charForThing(ThingMurkyUnknown);
+          background_color = rgbDarken(background_color, 0.8);
+        }
+      } else if (room->memory[roompos] == RememberedTileQualityDim) {
+        background_color = rgbDarken(background_color, 0.4);
+        buf[bufpos].foreground = ansiColorForThing(room->foreground[roompos]);
+        fg_char = charForThing(ThingMurkyUnknown);
+      } else if (room->memory[roompos] == RememberedTileQualityClear) {
+        background_color = rgbDarken(background_color, 0.6);
+        buf[bufpos].foreground = ansiColorForThing(room->foreground[roompos]);
+      }
+      buf[bufpos].background = rgbToAnsi(background_color);
+      Utf8Character first_character_class = classifyUtf8Character((u8)fg_char[0]);
+      // if it's a single ASCII character
+      if (first_character_class == Utf8CharacterAscii && fg_char[1] == '\0') {
+        buf[bufpos].bytes[0] = fg_char[0];
+      // if it's a pair of ASCII characters
+      } else if (first_character_class == Utf8CharacterAscii && fg_char[1] > 0 && fg_char[2] == '\0') {
+        buf[bufpos].bytes[0] = fg_char[0];
+        buf[bufpos+1].bytes[0] = fg_char[1];
+        buf[bufpos+1].background = buf[bufpos].background;
+        buf[bufpos+1].foreground = buf[bufpos].foreground;
+      } else if (first_character_class == Utf8CharacterThreeByte) {
+        if (strlen(fg_char) == 3) {// handle 2-wide characters
+          buf[bufpos+1].background = buf[bufpos].background;
+          buf[bufpos+1].foreground = buf[bufpos].foreground;
+        }
+        for (u32 k = 0; k < strlen(fg_char)/3; k++) {
+          if (k != 0) {
+            buf[bufpos+k].background = buf[bufpos].background;
+            buf[bufpos+k].foreground = buf[bufpos].foreground;
+          }
+          for (u32 l = 0; l < 3; l++) {
+            buf[bufpos+k].bytes[l] = fg_char[l+(k*3)];
+          }
+        }
+      } else if (first_character_class == Utf8CharacterFourByte) {
+        if (strlen(fg_char) == UTF8_MAX_WIDTH) {// assume all of these characters are 2-wide
+          buf[bufpos+1].background = buf[bufpos].background;
+          buf[bufpos+1].foreground = buf[bufpos].foreground;
+        }
+        for (u32 k = 0; k < strlen(fg_char)/UTF8_MAX_WIDTH; k++) {
+          for (u32 l = 0; l < UTF8_MAX_WIDTH; l++) {
+            buf[bufpos+k].bytes[l] = fg_char[l+(k*UTF8_MAX_WIDTH)];
+          }
+        }
+        // handle secondary bytes that didn't divide evenly
+        for (u32 k = 0; k < strlen(fg_char)%UTF8_MAX_WIDTH; k++) {
+          buf[bufpos+1].background = buf[bufpos].background;
+          buf[bufpos+1].foreground = buf[bufpos].foreground;
+          buf[bufpos+1].bytes[k] = fg_char[UTF8_MAX_WIDTH+k];
+        }
+      } else {
+        assert(false && "unhandled bullshit");
+      }
+    }
+  }
+}
+*/
 
 #endif //GAMESHARED_H

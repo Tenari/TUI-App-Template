@@ -9,14 +9,13 @@
 #include <string.h>
 #include "base/impl.c"
 #include "lib/network.c"
-#include "render.c"
+#include "lib/tui.c"
+#include "shared.h"
 //#include "assets/asset1.h"
 //#include "assets/asset2.h"
 //#include "assets/asset3.h"
 
 ///// #define a bunch of client-only tunable game constants
-#define SYSTEM_MESSAGES_LEN 32
-#define MAX_SYSTEM_MESSAGE_LEN 512
 #define GOAL_LOOPS_PER_S 50
 #define GOAL_LOOP_US 1000000/GOAL_LOOPS_PER_S
 #define LOGIN_NAME_BUFFER_LEN 16
@@ -102,6 +101,8 @@ typedef struct MenuState {
 } MenuState;
 
 typedef struct GameState {
+  u32 udp_pings_sent;
+  u32 udp_pongs_recieved;
   Screen screen;
   Screen old_screen;
   ThingList things;
@@ -114,8 +115,7 @@ typedef struct GameState {
   MenuState menu;
   MenuState section; // for tabbing through selected "portions" of the screen
   u8 choices[4];
-  UDPMessage keep_alive_msg;
-  UDPClient client;
+  MultiClient client;
   StringChunkList message_input;
 } GameState;
 
@@ -123,8 +123,6 @@ typedef struct GameState {
 global bool should_quit;
 global bool debug_mode = false;
 global Arena permanent_arena = {0};
-global u8List system_messages[SYSTEM_MESSAGES_LEN] = {0};
-global u8 system_message_index = 0;
 global GameState state = {0};
 global OutgoingMessageQueue* network_send_queue = {0};
 global ParsedServerMessageThreadQueue* network_recv_queue = {0};
@@ -201,81 +199,6 @@ fn bool thingDelete(ThingList* list, u64 id) {
   return false;
 }
 
-fn void addSystemMessage(u8* msg) {
-  // save the message to our system_messages ring buffer
-  memset(system_messages[system_message_index].items, 0, SYSTEM_MESSAGES_LEN);
-  sprintf((char*)system_messages[system_message_index].items, "%s", msg);
-  system_messages[system_message_index].length = strlen((char*)system_messages[system_message_index].items);
-  system_message_index += 1;
-  if (system_message_index == SYSTEM_MESSAGES_LEN) {
-    system_message_index = 0;
-  }
-}
-
-fn void renderSystemMessages(Pixel* buf, Dim2 screen_dimensions, Box sys_msg_box) {
-  i32 printable_lines = sys_msg_box.height - 2;
-  if (printable_lines > SYSTEM_MESSAGES_LEN) {
-    printable_lines = SYSTEM_MESSAGES_LEN;
-  }
-  for (i32 i = 0; i < printable_lines; i++) {
-    i32 index = (system_message_index - 1 - i);
-    if (index < 0) {
-      index = SYSTEM_MESSAGES_LEN + index;
-    }
-    u32 y = sys_msg_box.y + (sys_msg_box.height - i) - 1;
-    u8List sys_msg = system_messages[index];
-    for (i32 j = 0; j < MAX_SYSTEM_MESSAGE_LEN && j < sys_msg_box.width-4; j++) {
-      u32 pos = (sys_msg_box.x + 2+j) + (screen_dimensions.width * y);
-      if (j < sys_msg.length) {
-        if (sys_msg.items[j] != '\n') {
-          buf[pos].bytes[0] = sys_msg.items[j];
-        }
-      }
-    }
-  }
-}
-
-fn void renderPercentBar(TuiState* tui, u16 x, u16 y, u16 width, u8 ansi_color, u64 value, u64 max) {
-  Pixel* buf = tui->frame_buffer;
-  Dim2 screen_dimensions = tui->screen_dimensions;
-  u16 pos = x + (screen_dimensions.width * y);
-  buf[pos].bytes[0] = '[';
-  pos = x+width + (screen_dimensions.width * y);
-  buf[pos].bytes[0] = ']';
-  pos = x+1 + (screen_dimensions.width * y);
-  f32 base_ratio = 0;
-  if (max != 0) {
-    base_ratio = ((f32)value / (f32)max);
-  }
-  f32 raw_ratio = base_ratio * (width-2);
-  u32 full_spaces_count = (u32) raw_ratio;
-  f32 remainder = raw_ratio - full_spaces_count;
-  for (u32 i = 0; i < full_spaces_count; i++) {
-    buf[pos+i].foreground = ansi_color;
-    renderUtf8CharToBuffer(buf, x+1+i, y, "█", screen_dimensions);
-  }
-  buf[pos+full_spaces_count].foreground = ansi_color;
-  if (value == max) {
-    renderUtf8CharToBuffer(buf, x+1+full_spaces_count, y, "█", screen_dimensions);
-  } else if (remainder > 0.875) {
-    renderUtf8CharToBuffer(buf, x+1+full_spaces_count, y, "▉", screen_dimensions);
-  } else if (remainder > 0.75) {
-    renderUtf8CharToBuffer(buf, x+1+full_spaces_count, y, "▊", screen_dimensions);
-  } else if (remainder > 0.625) {
-    renderUtf8CharToBuffer(buf, x+1+full_spaces_count, y, "▋", screen_dimensions);
-  } else if (remainder > 0.5) {
-    renderUtf8CharToBuffer(buf, x+1+full_spaces_count, y, "▌", screen_dimensions);
-  } else if (remainder > 0.375) {
-    renderUtf8CharToBuffer(buf, x+1+full_spaces_count, y, "▍", screen_dimensions);
-  } else if (remainder > 0.25) {
-    renderUtf8CharToBuffer(buf, x+1+full_spaces_count, y, "▎", screen_dimensions);
-  } else if (remainder > 0.125) {
-    renderUtf8CharToBuffer(buf, x+1+full_spaces_count, y, "▏", screen_dimensions);
-  } else {
-    renderUtf8CharToBuffer(buf, x+1+full_spaces_count, y, " ", screen_dimensions);
-  }
-}
-
 fn void renderSpeechBubble(TuiState* tui, u16 x, u16 y, u16 max_width, String message, SpeechTailDirection dir) {
   Pixel* buf = tui->frame_buffer;
   Dim2 screen_dimensions = tui->screen_dimensions;
@@ -321,23 +244,6 @@ fn void renderSpeechBubble(TuiState* tui, u16 x, u16 y, u16 max_width, String me
   // TODO actually print the speech tail
 }
 
-fn void renderStaticAssetToPixelBuffer(TuiState* tui, u8* asset, u32 len, u16 x, u16 y) {
-  u16 line = 0;
-  u16 x_in_line = 0;
-  u16 pos = x + (tui->screen_dimensions.width * y);
-  for (u32 i = 0; i < len; i++, x_in_line++) {
-    if (asset[i] == '\n') {
-      line += 1;
-      x_in_line = 0;
-      pos = x + (tui->screen_dimensions.width * (y+line));
-    } else if (asset[i] == ' ') {
-      // do nothing, we skip spaces in our assets
-    } else {
-      tui->frame_buffer[pos+x_in_line].bytes[0] = asset[i];
-    }
-  }
-}
-
 fn void clearServerSentState() {
   //memset(&state.current_room, 0, sizeof(RenderableRoom));
 
@@ -347,7 +253,11 @@ fn void clearServerSentState() {
   state.things.items = arenaAllocArray(&state.thing_arena, Thing, state.things.capacity);
 }
 
-fn void handleIncomingMessage(u8* message, u32 len, SocketAddress sender, i32 socket) {
+fn void handleIncomingMessage(u8* message, i32 len, SocketAddress sender, i32 socket) {
+  if (len <= 0) {
+    addSystemMessage((u8*)"len<=0 messages not supported");
+    return;
+  }
   Message msg_type = message[0];
   dbg("handleIncomingMessage() of len=%d, message=%s\n", len, MESSAGE_STRINGS[msg_type]);
   u8List bytes = {len, len, message};
@@ -355,6 +265,7 @@ fn void handleIncomingMessage(u8* message, u32 len, SocketAddress sender, i32 so
   ParsedServerMessage parsed = {0};
   parsed.type = msg_type;
   switch (msg_type) {
+    case MessageUDPPong:
     case MessageNewAccountCreated:
     case MessageBadPw: {/*nothing to parse but the type*/} break;
     case MessageCharacterId: {
@@ -370,29 +281,38 @@ fn void handleIncomingMessage(u8* message, u32 len, SocketAddress sender, i32 so
   psmThreadSafeQueuePush(network_recv_queue, &parsed);
 }
 
-fn void* receiveNetworkUpdates(void* udp) {
-  UDPClient client = *(UDPClient*)udp;
-  dbg("receiveNetworkUpdates() sock=%d\n", client.socket);
-  UDPServer server = {
-    .ready = true,
-    .server_address = client.server_address,
-    .server_socket = client.socket
-  };
-  infiniteReadUDPServer(&server, handleIncomingMessage);
+fn void* receiveNetworkUpdates(void* multi) {
+  MultiClient *client = (MultiClient*)multi;
+  u32 usec_to_sleep = 1000000; // start @ 1 sec
+  while (!should_quit) {
+    if (!client->tcp_client.ready) {
+      osSleepMicroseconds(usec_to_sleep);
+      netReconnectTCPClient(&client->tcp_client);
+    }
+    if (client->tcp_client.ready) {
+      usec_to_sleep = 1000000; // start @ 1 sec
+      netInfiniteReadMultiClient(client, &should_quit, handleIncomingMessage, addSystemMessage);
+    } else {
+      usec_to_sleep = Min(usec_to_sleep * 1.5, 60000000); // cap out at 1 minute of sleeping
+    }
+  }
   return NULL;
 }
 
-fn void* sendNetworkUpdates(void* udp) {
-  i32 socket_fd = ((UDPClient*)udp)->socket;
-  dbg("sendNetworkUpdates() sock=%d\n", socket_fd);
+fn void* sendNetworkUpdates(void* multi_client) {
+  MultiClient *client = (MultiClient*)multi_client;
   u8List bytes_list = {0};
   while (!should_quit) {
-    UDPMessage msg = {0};
+    NetworkMessage msg = {0};
     outgoingMessageQueuePop(network_send_queue, &msg);
-    bytes_list.items = msg.bytes;
-    bytes_list.length = msg.bytes_len;
-    bytes_list.capacity = msg.bytes_len;
-    sendUDPu8List(socket_fd, &msg.address, &bytes_list);
+    if (msg.tcp) {
+      sendTCPMessage(msg);
+    } else {
+      bytes_list.items = msg.bytes;
+      bytes_list.length = msg.bytes_len;
+      bytes_list.capacity = msg.bytes_len;
+      sendUDPu8List(client->udp_client.socket, &msg.address, &bytes_list);
+    }
   }
   return NULL;
 }
@@ -400,7 +320,6 @@ fn void* sendNetworkUpdates(void* udp) {
 fn bool updateAndRender(TuiState* tui, void* s, u8* input_buffer, u64 loop_count) {
   GameState* state = (GameState*) s;
   state->loop_count = loop_count;
-  UDPClient* udp = &state->client;
   state->old_screen = state->screen;
   Dim2 screen_dimensions = tui->screen_dimensions;
   bool game_screen_changed = state->old_screen != state->screen; // detect new screens
@@ -408,6 +327,13 @@ fn bool updateAndRender(TuiState* tui, void* s, u8* input_buffer, u64 loop_count
   if (screen_dimensions.height > MAX_SCREEN_HEIGHT || screen_dimensions.width > MAX_SCREEN_WIDTH) {
     printf("\033[2J\033[%d;%df Your screen is too damn big. Shrink it to %dx%d max, bro... geez", 1,1, MAX_SCREEN_WIDTH, MAX_SCREEN_HEIGHT);
     fflush(stdout);
+    return should_quit;
+  }
+  char sbuf[SBUFLEN] = {0};
+  if (!state->client.tcp_client.ready) {
+    state->screen = ScreenLogin;
+    state->login_state.state = LoginScreenStateInit;
+    renderStrToBuffer(tui->frame_buffer, 5, 1, "Network disconnected. Reconnecting...", screen_dimensions);
     return should_quit;
   }
 
@@ -418,6 +344,9 @@ fn bool updateAndRender(TuiState* tui, void* s, u8* input_buffer, u64 loop_count
   while (next_net_msg != NULL) {
     msg_iters += 0;
     switch (msg.type) {
+      case MessageUDPPong: {
+        state->udp_pongs_recieved += 1;
+      } break;
       case MessageNewAccountCreated: {
         state->screen = ScreenCreateCharacter;
       } break;
@@ -441,7 +370,7 @@ fn bool updateAndRender(TuiState* tui, void* s, u8* input_buffer, u64 loop_count
     next_net_msg = psmThreadSafeNonblockingQueuePop(network_recv_queue, &msg);
     msg_iters++;
   }
-  
+
   // operate on screen-based input+state
   bool user_pressed_esc = input_buffer[0] == ASCII_ESCAPE && input_buffer[1] == 0;
   bool user_pressed_a_number = input_buffer[0] >= '1' && input_buffer[0] <= '9' && input_buffer[1] == 0;
@@ -476,8 +405,8 @@ fn bool updateAndRender(TuiState* tui, void* s, u8* input_buffer, u64 loop_count
           state->menu.len = 2;
         } else {
           // send character color to server
-          UDPMessage msg = {0};
-          msg.address = udp->server_address;
+          NetworkMessage msg = { .tcp = true, .socket_fd = state->client.tcp_client.socket };
+          msg.address = state->client.tcp_client.server_address;
           msg.bytes_len = 2;
           // 1. msg type/CommandType
           msg.bytes[0] = CommandCreateCharacter;
@@ -513,8 +442,23 @@ fn bool updateAndRender(TuiState* tui, void* s, u8* input_buffer, u64 loop_count
         should_quit = true;
       }
 
+      if (input_buffer[0] == 'p' && input_buffer[1] == 0) {
+        NetworkMessage msg = { .tcp = false, .socket_fd = state->client.udp_client.socket };
+        msg.address = state->client.udp_client.server_address;
+        msg.bytes[0] = CommandUDPPing;
+        msg.bytes_len = 1;
+        outgoingMessageQueuePush(network_send_queue, &msg);
+
+        state->udp_pings_sent += 1;
+      }
+
       // RENDERING
       renderStrToBuffer(tui->frame_buffer, 5, 1, "Games typically would render something here...", screen_dimensions);
+
+      MemoryZero(sbuf, SBUFLEN);
+      sprintf(sbuf, "Press 'P' to send UDP Ping. Pings: %d Pongs: %d", state->udp_pings_sent, state->udp_pongs_recieved);
+      renderStrToBuffer(tui->frame_buffer, 5, 2, sbuf, screen_dimensions);
+
       bool room_active = state->section.selected_index == 0;
       u32 tabs_y = 1 + 2 + 2;
       u32 tx = 2;
@@ -573,13 +517,13 @@ fn bool updateAndRender(TuiState* tui, void* s, u8* input_buffer, u64 loop_count
         } else {
           u32 msg_idx = 0;
           // drop the login message into the network_send_queue
-          UDPMessage msg = {0};
-          msg.address = udp->server_address;
+          NetworkMessage msg = { .tcp = true, .socket_fd = state->client.tcp_client.socket };
+          msg.address = state->client.tcp_client.server_address;
           // 1. msg type/CommandType
           msg.bytes[msg_idx++] = CommandLogin;
           // 2. our LAN-IP to handle the case where we are on the same LAN as the guy we are trying to fight
           // and our "listened" UDP port
-          msg_idx += writeU16ToBufferLE(msg.bytes + msg_idx, ~(udp->client_port));
+          msg_idx += writeU16ToBufferLE(msg.bytes + msg_idx, ~(state->client.udp_client.client_port));
           msg_idx += writeI32ToBufferLE(msg.bytes + msg_idx, ~osLanIPAddress());
           // 2. how long is the name
           msg.bytes[msg_idx++] = state->login_state.name.length;
@@ -671,11 +615,6 @@ fn bool updateAndRender(TuiState* tui, void* s, u8* input_buffer, u64 loop_count
       break;
   }
   
-  if (loop_count % 10 == 0) {
-    outgoingMessageQueuePush(network_send_queue, &state->keep_alive_msg);
-    //outgoingMessageQueuePush(network_send_queue, &testm);
-  }
-
   return should_quit;
 }
 
@@ -698,11 +637,7 @@ i32 main(i32 argc, ptr argv[]) {
   arenaInit(&state.string_arena.a);
   state.string_arena.mutex = newMutex();
   state.message_input = stringChunkListInit(&state.string_arena);
-  for (i32 i = 0; i < SYSTEM_MESSAGES_LEN; i++) {
-    system_messages[i].capacity = MAX_SYSTEM_MESSAGE_LEN;
-    system_messages[i].length = 0;
-    system_messages[i].items = arenaAllocArraySized(&permanent_arena, sizeof(u8), MAX_SYSTEM_MESSAGE_LEN);
-  }
+  initSystemMessages(&permanent_arena);
 
   // network queues
   network_send_queue = newOutgoingMessageQueue(&permanent_arena);
@@ -732,12 +667,11 @@ i32 main(i32 argc, ptr argv[]) {
       server_address = input_string;
     }
   }
-  state.client = createUDPClient(7777, server_address);
-
-  // "hardcoded" keep alive message to periodically send to server
-  state.keep_alive_msg.address = state.client.server_address;
-  state.keep_alive_msg.bytes[0] = CommandKeepAlive;
-  state.keep_alive_msg.bytes_len = 1;
+  state.client = netCreateMultiClient(7777, server_address);
+  if (!state.client.tcp_client.ready || !state.client.udp_client.ready) {
+    printf("a net client wanst ready");
+    exit(1);
+  }
 
   Thread recv_thread = spawnThread(&receiveNetworkUpdates, &state.client);
   Thread send_thread = spawnThread(&sendNetworkUpdates, &state.client);

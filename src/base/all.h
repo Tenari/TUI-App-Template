@@ -238,6 +238,10 @@
 // only valid if there's an in-scope variable bool `debug_mode`
 #define dbg(fmt, ...) osDebugPrint(debug_mode, fmt, ##__VA_ARGS__)
 
+///// SYSTEM INCLUDES I always want
+#include <stdio.h>
+#include <unistd.h>
+
 ///// TYPES
 // integer types
 typedef unsigned char         u8;
@@ -438,7 +442,27 @@ union Range1f32
 	  DWORD input_mode;
 	  DWORD output_mode;
 	} TermIOs;
+  // <poll.h> networking shim for windows
+#ifndef POLLIN
+#  define POLLIN    0x0001
+#  define POLLPRI   0x0002
+#  define POLLOUT   0x0004
+#  define POLLERR   0x0008
+#  define POLLHUP   0x0010
+#  define POLLNVAL  0x0020
+
+  typedef struct pollfd {
+    SOCKET  fd;
+    short   events;
+    short   revents;
+  } pollfd_t;
+#endif
+
+  typedef int nfds_t;
+
+  int poll(struct pollfd *fds, nfds_t nfds, int timeout);
 #else
+#  include <poll.h>
 #  include <sys/socket.h>
 #  include <netinet/in.h>
 #  include <netdb.h>
@@ -569,40 +593,42 @@ fn bool isAlphaUnderscoreSpace(u8 c);
 fn bool isSimplePrintable(u8 c);
 
 ///// OS-wrapped apis
-void osInit();
-void* osThreadContextGet();
-void osThreadContextSet(void* ctx);
+void      osInit();
+void*     osThreadContextGet();
+void      osThreadContextSet(void* ctx);
+bool      osThreadJoin(Thread handle, u64 endt_us);
 
 fn Barrier osBarrierAlloc(u64 count);
-fn void osBarrierRelease(Barrier barrier);
-fn void osBarrierWait(Barrier barrier);
+fn void   osBarrierRelease(Barrier barrier);
+fn void   osBarrierWait(Barrier barrier);
 
 // Memory
-fn void* osMemoryReserve(u64 size);
-fn void  osMemoryCommit(void* memory, u64 size);
-fn void  osMemoryDecommit(void* memory, u64 size);
-fn void  osMemoryRelease(void* memory, u64 size);
-fn u64   osTimeMicrosecondsNow();
-fn void  osSleepMicroseconds(u32 t);
+fn void*  osMemoryReserve(u64 size);
+fn void   osMemoryCommit(void* memory, u64 size);
+fn void   osMemoryDecommit(void* memory, u64 size);
+fn void   osMemoryRelease(void* memory, u64 size);
+fn u64    osTimeMicrosecondsNow();
+fn void   osSleepMicroseconds(u32 t);
 
-fn bool osFileExists(String filename);
+// Files
+fn bool   osFileExists(String filename);
 fn String osFileRead(Arena* arena, ptr filepath);
-fn bool osFileCreate(String filename);
-fn bool osFileCreateWrite(String filename, String data);
-fn bool osFileWrite(String filename, String data);
+fn bool   osFileCreate(String filename);
+fn bool   osFileCreateWrite(String filename, String data);
+fn bool   osFileWrite(String filename, String data);
 
-fn void osDebugPrint(bool debug_mode, const char* format, ...);
+fn void   osDebugPrint(bool debug_mode, const char* format, ...);
 
-TermIOs osStartTUI(bool blocking);
-fn void osEndTUI(TermIOs old_terminal_attributes);
-fn Dim2 osGetTerminalDimensions();
-void osBlitToTerminal(ptr writeable_output_ansi_string, i64 count);
-void osReadConsoleInput(u8* buffer, u32 len);
+// Tui stuff
+TermIOs   osStartTUI(bool blocking);
+fn void   osEndTUI(TermIOs old_terminal_attributes);
+fn Dim2   osGetTerminalDimensions();
+void      osBlitToTerminal(ptr writeable_output_ansi_string, i64 count);
+void      osReadConsoleInput(u8* buffer, u32 len);
 
-bool osInitNetwork();
-i32 osLanIPAddress();
-
-bool osThreadJoin(Thread handle, u64 endt_us);
+// network stuff
+bool      osInitNetwork();
+i32       osLanIPAddress();
 
 ///// Basic THREAD synchronization apis
 Thread spawnThread(void * (*threadFn)(void *), void* thread_arg);

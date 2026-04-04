@@ -6,14 +6,13 @@
  *  my_variable
  *  MY_CONSTANT
  * */
-#include <stdio.h>
 #include <stdlib.h>
 #include <sys/random.h>
 #include "shared.h"
 #include "base/impl.c"
 #define NET_OUTGOING_MESSAGE_QUEUE_LEN 64
 #include "lib/network.c"
-#include "render.c"
+#include "lib/tui.c"
 
 ///// CONSTANTS
 #define MAX_THINGS (2<<18)
@@ -28,7 +27,6 @@
 #define GOAL_NETWORK_SEND_LOOP_US 1000000/GOAL_NETWORK_SEND_LOOPS_PER_S
 #define GOAL_GAME_LOOPS_PER_S 4
 #define GOAL_GAME_LOOP_US 1000000/GOAL_GAME_LOOPS_PER_S
-#define CLIENT_TIMEOUT_FRAMES GOAL_GAME_LOOPS_PER_S*3
 #define CHUNK_SIZE 64
 #define ACCOUNT_CHUNK_SIZE 64
 #define PARSED_CLIENT_COMMAND_THREAD_QUEUE_LEN 64
@@ -41,6 +39,7 @@ typedef struct ParsedClientCommand {
   u16 alt_port;
   u32 sender_ip;
   u32 alt_ip;
+  i32 socket_fd;
   StringChunkList name;
   StringChunkList pass;
   u64 id;
@@ -94,13 +93,15 @@ typedef struct AccountChunk {
 } AccountChunk;
 
 typedef struct Client {
+  bool active;
   u16 lan_port;
   i32 lan_ip;
+  i32 socket_fd; // the tcp socket
   ThingRef character_eid;
-  u64 account_id;
   SocketAddress address;
+  u64 account_id;
+  u64 connected_on;
   CommandType commands[CLIENT_COMMAND_LIST_LEN];
-  u64 last_ping;
 } Client;
 
 typedef struct ClientList {
@@ -110,6 +111,7 @@ typedef struct ClientList {
 } ClientList;
 
 typedef struct State {
+  bool should_quit;
   Mutex client_mutex;
   Mutex mutex;
   ClientList clients;
@@ -117,6 +119,7 @@ typedef struct State {
   u64 frame;
   Arena game_scratch;
   StringArena string_arena;
+  MultiServer server;
   ParsedClientCommandThreadQueue* network_recv_queue;
   OutgoingMessageQueue* network_send_queue;
   Things* things;
@@ -344,10 +347,12 @@ fn void exitWithErrorMessage(ptr msg) {
   exit(1);
 }
 
-fn u32 pushClient(ClientList* clients, SocketAddress addr) {
-  Client new_client = {0};
-  new_client.last_ping = state.frame;
-  new_client.address = addr;
+fn u32 pushClient(ClientList* clients, SocketAddress addr, i32 socket_fd) {
+  Client new_client = {
+    .active = true,
+    .socket_fd = socket_fd,
+    .address = addr,
+  };
 
   // first, try to overwrite an old dc'ed client
   for (u32 i = 1; i < clients->length; i++) {
@@ -398,11 +403,12 @@ fn u32 findClientHandleBySocketAddress(ClientList* clients, SocketAddress addres
   return 0;
 }
 
-fn void handleIncomingMessage(u8* message, u32 len, SocketAddress sender, i32 socket) {
-  dbg("%d: %s from %s:%d\n", len, command_type_strings[message[0]], inet_ntoa(sender.sin_addr), sender.sin_port);
+fn void handleIncomingMessage(u8* message, i32 len, SocketAddress sender, i32 socket) {
+  dbg("%d: %s from %s:%d\n", len, COMMAND_TYPE_STRINGS[message[0]], inet_ntoa(sender.sin_addr), sender.sin_port);
   u32 msg_idx = 0;
   ParsedClientCommand parsed = {
     .type = (CommandType)message[msg_idx++],
+    .socket_fd = socket,
     .sender_ip = sender.sin_addr.s_addr,
     .sender_port = sender.sin_port,
   };
@@ -413,6 +419,7 @@ fn void handleIncomingMessage(u8* message, u32 len, SocketAddress sender, i32 so
     .capacity = 0,
   };
   switch (parsed.type) {
+    case CommandUDPPing: {} break;
     case CommandLogin: {
       // parse the login command
       parsed.alt_port = ~readU16FromBufferLE(message + msg_idx);
@@ -447,8 +454,6 @@ fn void handleIncomingMessage(u8* message, u32 len, SocketAddress sender, i32 so
 
       printf("Logging in player: %s %d %s\n", MESSAGE_STRINGS[parsed.type], name_len, message + 7);
     } break;
-    case CommandKeepAlive:
-      break;
     case CommandCreateCharacter: {
       printf("command create character received\n");
       parsed.byte = message[1];
@@ -463,31 +468,52 @@ fn void handleIncomingMessage(u8* message, u32 len, SocketAddress sender, i32 so
   fflush(stdout);
 }
 
-fn void* receiveNetworkUpdates(void* udp) {
-  UDPServer server = *(UDPServer*)udp;
-  dbg("receiveNetworkUpdates() sock=%d\n", server.server_socket);
-  infiniteReadUDPServer(&server, handleIncomingMessage);
+fn void removeClientBySocketFd(i32 socket_fd) {
+  Client blank_client = {0};
+  // i=1 because first client is null-client
+  for (u32 i = 1; i < state.clients.length; i++) {
+    if (state.clients.items[i].active && state.clients.items[i].socket_fd == socket_fd) {
+      state.clients.items[i] = blank_client;
+    }
+  }
+}
+
+fn void* receiveNetworkUpdates(void* multi) {
+  MultiServer server = *(MultiServer*)multi;
+  netInfiniteReadMultiServer(
+    &server,
+    &state.should_quit,
+    handleIncomingMessage,
+    removeClientBySocketFd,
+    addSystemMessage
+  );
   return NULL;
 }
 
-fn void* sendNetworkUpdates(void* sock) {
+fn void* sendNetworkUpdates(void* multi) {
   ThreadContext tctx = {0};
   tctxInit(&tctx);
-  i32* socket_ptr = (i32*)sock;
-  i32 socket = *socket_ptr;
-  while (true) {
+  MultiServer *server = (MultiServer*) multi;
+  while (!state.should_quit) {
     u64 loop_start = osTimeMicrosecondsNow();
 
     // 1. clear out our "outgoingMessage" queue
-    {
-      UDPMessage to_send = { 0 };
-      UDPMessage* next_to_send = outgoingMessageNonblockingQueuePop(state.network_send_queue, &to_send);
+        {
+      NetworkMessage to_send = { 0 };
+      NetworkMessage* next_to_send = outgoingMessageNonblockingQueuePop(state.network_send_queue, &to_send);
       u8List bytes_list = { 0 };
       while (next_to_send != NULL) {
-        bytes_list.items = to_send.bytes;
-        bytes_list.length = to_send.bytes_len;
-        bytes_list.capacity = to_send.bytes_len;
-        sendUDPu8List(socket, &to_send.address, &bytes_list);
+        if (to_send.tcp) {
+          char sbuf[SBUFLEN] = {0};
+          sprintf(sbuf, "sendTCPMessage() sock=%d msg=%s len=%d\n", to_send.socket_fd, MESSAGE_STRINGS[to_send.bytes[0]], to_send.bytes_len);
+          addSystemMessage((u8*)sbuf);
+          sendTCPMessage(to_send);
+        } else { // UDP
+          bytes_list.items = to_send.bytes;
+          bytes_list.length = to_send.bytes_len;
+          bytes_list.capacity = to_send.bytes_len;
+          sendUDPu8List(server->udp_server.server_socket, &to_send.address, &bytes_list);
+        }
         next_to_send = outgoingMessageNonblockingQueuePop(state.network_send_queue, &to_send);
       }
     }
@@ -496,7 +522,7 @@ fn void* sendNetworkUpdates(void* sock) {
       // WARNING the `i` starts at 1 here because state.clients.items[0] is a "null" Client
       for (u32 i = 1; i < state.clients.length; i++) {
         Client client = state.clients.items[i];
-        if (client.last_ping+CLIENT_TIMEOUT_FRAMES < state.frame) {
+        if (client.active == false) {
           memset(&state.clients.items[i], 0, sizeof(Client));
           continue;
         }
@@ -516,8 +542,8 @@ fn void* sendNetworkUpdates(void* sock) {
   return NULL;
 }
 
-fn bool messageSendCharacterId(SocketAddress sender, ThingRef id) {
-  UDPMessage outgoing_message = {0};
+fn bool messageSendCharacterId(i32 socket_fd, SocketAddress sender, ThingRef id) {
+  NetworkMessage outgoing_message = { .tcp = true, .socket_fd = socket_fd };
   outgoing_message.address = sender;
   outgoing_message.bytes_len = 9;
   outgoing_message.bytes[0] = (u8)MessageCharacterId;
@@ -536,7 +562,7 @@ fn void* gameLoop(void* params) {
   tctxInit(&tctx);
   printf("Lane %lld (%lld) of %lld starting.\n", lane_ctx->lane_idx, LaneIdx(), lane_ctx->lane_count);
   fflush(stdout);
-  UDPMessage outgoing_message = {0};
+  NetworkMessage outgoing_message = {0};
   u64 loop_start;
   u64 last_burn = 0;
   u64 last_hp_regen = 0;
@@ -563,13 +589,19 @@ fn void* gameLoop(void* params) {
         u32 client_handle = findClientHandleBySocketAddress(&state.clients, sender);
         Client* client = &state.clients.items[client_handle];
         switch (msg.type) {
-          case CommandKeepAlive: {
-            dbg("KeepAlive for client_handle=%d, %ld", client_handle, state.frame);
-            state.clients.items[client_handle].last_ping = state.frame;
+          case CommandUDPPing: {
+            // send UDP Pong right back
+            outgoing_message.tcp = false;
+            outgoing_message.socket_fd = state.server.udp_server.server_socket;
+            outgoing_message.bytes[0] = MessageUDPPong;
+            outgoing_message.bytes_len = 1;
+            outgoing_message.address = sender;
+            outgoingMessageQueuePush(state.network_send_queue, &outgoing_message);
+            printf("MessageUDPPong sent\n");
           } break;
           case CommandLogin: {
             if (client_handle == 0) {
-              client_handle = pushClient(&state.clients, sender);
+              client_handle = pushClient(&state.clients, sender, msg.socket_fd);
               client = &state.clients.items[client_handle];
               printf("pushed new client handle = %d\n", client_handle);
             }
@@ -602,9 +634,11 @@ fn void* gameLoop(void* params) {
                 printf(" pw matched\n");
               } else {
                 // tell the client they did a bad pw
+                outgoing_message.tcp = true;
+                outgoing_message.socket_fd = client->socket_fd;
+                outgoing_message.address = sender;
                 outgoing_message.bytes[0] = (u8)MessageBadPw;
                 outgoing_message.bytes_len = 1;
-                outgoing_message.address = sender;
                 outgoingMessageQueuePush(state.network_send_queue, &outgoing_message);
                 printf("MessageBadPw sent\n");
                 break;
@@ -622,12 +656,14 @@ fn void* gameLoop(void* params) {
               client->character_eid = existing_account->eid;
 
               // tell the client their character id
-              messageSendCharacterId(sender, existing_account->eid);
+              messageSendCharacterId(client->socket_fd, sender, existing_account->eid);
             } else {
               // tell the client they made a new account
+              outgoing_message.tcp = true;
+              outgoing_message.socket_fd = client->socket_fd;
+              outgoing_message.address = sender;
               outgoing_message.bytes[0] = (u8)MessageNewAccountCreated;
               outgoing_message.bytes_len = 1;
-              outgoing_message.address = sender;
               outgoingMessageQueuePush(state.network_send_queue, &outgoing_message);
               printf("MessageNewAccountCreated sent\n");
             }
@@ -650,7 +686,7 @@ fn void* gameLoop(void* params) {
               printf("character_eid=%d, client_handle=%d, acct_id=%lld\n", account->eid.i, client_handle, account->id);
 
               // tell the client their character id
-              messageSendCharacterId(sender, character.id);
+              messageSendCharacterId(client->socket_fd, sender, character.id);
             } else {
               printf("client tried to create a character when he already has one.");
             }
@@ -720,14 +756,15 @@ i32 main(i32 argc, ptr argv[]) {
   state.accounts.capacity = ACCOUNT_CHUNK_SIZE;
   state.accounts.items = arenaAllocArray(&permanent_arena, Account, ACCOUNT_CHUNK_SIZE);
   state.things = arenaAllocZero(&permanent_arena, sizeof(Things));
+  initSystemMessages(&permanent_arena);
 
   // networking threads (send + receive)
-  UDPServer listener = createUDPServer(SERVER_PORT);
-  if (!listener.ready) {
-    exitWithErrorMessage("Couldn't start the udp server");
+  state.server = netCreateMultiServer(SERVER_PORT);
+  if (!state.server.tcp_server.ready || !state.server.udp_server.ready) {
+    exitWithErrorMessage("Couldn't start the tcp or udp server");
   }
-  Thread send_thread = spawnThread(&sendNetworkUpdates, &listener.server_socket);
-  Thread recv_thread = spawnThread(&receiveNetworkUpdates, &listener);
+  Thread send_thread = spawnThread(&sendNetworkUpdates, &state.server);
+  Thread recv_thread = spawnThread(&receiveNetworkUpdates, &state.server);
 
   u64 lane_broadcast_val = 0;
   Barrier barrier = osBarrierAlloc(GAME_THREAD_CONCURRENCY);
